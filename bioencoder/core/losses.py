@@ -146,6 +146,78 @@ class LabelSmoothingLoss(nn.Module):
             true_dist.scatter_(1, target.data.unsqueeze(1), self.confidence)
         return torch.mean(torch.sum(-true_dist * pred, dim=self.dim))
 
+class WeightedSupConLoss(SupConLoss):
+    def __init__(self, temperature=0.07, contrast_mode="all", base_temperature=0.07):
+        super(WeightedSupConLoss, self).__init__(temperature, contrast_mode, base_temperature)
+
+    def forward(self, features, phylo_distances=None):
+        """
+        Args:
+            features: hidden vectors [bsz, n_views, ...]
+            phylo_distances: tensor [bsz, bsz], distance between species
+        """
+        device = torch.device("cuda") if features.is_cuda else torch.device("cpu")
+
+        if len(features.shape) < 3:
+            raise ValueError("`features` needs to be [bsz, n_views, ...], at least 3 dimensions required")
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        batch_size = features.shape[0]
+
+        if phylo_distances is None:
+            raise ValueError("You must provide a phylogenetic distance matrix.")
+
+        # Create similarity weights
+        with torch.no_grad():
+            sim_weights = torch.exp(-phylo_distances)  # Higher similarity for closer species
+            sim_weights.fill_diagonal_(0)  # No self-comparison
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+
+        if self.contrast_mode == "one":
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.contrast_mode == "all":
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError(f"Unknown mode: {self.contrast_mode}")
+
+        # compute logits
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T), self.temperature
+        )
+
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # tile similarity weights
+        sim_weights = sim_weights.repeat(anchor_count, contrast_count)
+
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(sim_weights),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0,
+        )
+        sim_weights = sim_weights * logits_mask
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        # compute weighted mean of log-likelihood over positives
+        mean_log_prob_pos = (sim_weights * log_prob).sum(1) / (sim_weights.sum(1) + 1e-12)
+
+        # loss
+        loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+
+        return loss
 
 LOSSES = {
     "SupCon": SupConLoss,
